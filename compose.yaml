@@ -1,0 +1,14 @@
+services:
+  game:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      APP_URL: "${APP_URL:-http://localhost:3000}"
+      DATABASE_PATH: /data/game.sqlite
+    volumes:
+      - game-data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+volumes:
+  game-data:

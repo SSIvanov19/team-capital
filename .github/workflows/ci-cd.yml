@@ -1,0 +1,109 @@
+name: Validate and deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: team-capital-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: browser-failures
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/ssivanov19/team-capital:sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/SSIvanov19/team-capital
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Test the production container
+        run: |
+          docker volume create smoke-data
+          docker run -d --name smoke -p 3000:3000 -v smoke-data:/data -e APP_URL=http://localhost:3000 "$IMAGE"
+          trap 'docker logs smoke; docker rm -f smoke; docker volume rm smoke-data' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:3000/api/health; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://localhost:3000/api/health
+          docker exec smoke node -e 'const D=require("better-sqlite3");const db=new D("/data/game.sqlite");if(db.prepare("pragma integrity_check").get().integrity_check!=="ok")process.exit(1);console.log(process.version);db.close()'
+      - name: Publish image and obtain immutable digest
+        id: image
+        run: |
+          docker push "$IMAGE"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: SSIvanov19/TC.Deployment
+          ref: main
+          path: deployment
+          ssh-key: ${{ secrets.TC_DEPLOY_KEY }}
+      - name: Update desired production image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          current=$(gh api repos/SSIvanov19/team-capital/git/ref/heads/main --jq .object.sha)
+          if [ "$current" != "$GITHUB_SHA" ]; then
+            echo 'A newer source revision exists; skip this outdated release.'
+            exit 0
+          fi
+          python3 .github/scripts/update-deployment.py
+          cd deployment
+          git config user.name 'team-capital-ci'
+          git config user.email 'team-capital-ci@users.noreply.github.com'
+          git add k8s/team-capital/prod/kustomization.yaml
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Deploy Team Capital $GITHUB_SHA"
+          current=$(gh api repos/SSIvanov19/team-capital/git/ref/heads/main --jq .object.sha)
+          if [ "$current" != "$GITHUB_SHA" ]; then exit 0; fi
+          git push origin HEAD:main
